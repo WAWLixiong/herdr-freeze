@@ -1,0 +1,77 @@
+# Herdr freeze plugin manifest.
+#
+# 自动冻结空闲面板（挂起进程树、释放内存），整个标签页全部冻结时弹出
+# 「❄ 已冻结 · 点击恢复」蒙层；点击/按键恢复整个标签页。
+#
+# 配置以 herdr workspace 元数据 token 存储（freeze_enabled / freeze_idle_secs），
+# 通过 `herdr-freeze config` 动作设置或直接 CLI 设置。
+#
+# herdr 不允许同 id 的 action/pane 按平台重复声明（duplicate_plugin_action_id），
+# 因此跨平台使用单一命令 —— 纯名 `herdr-freeze`（herdr 在 Windows 上按 PATHEXT
+# 解析 .exe）。开发/安装前置：把 release 二进制放到 PATH：
+#   cargo install --path .        # 装到 ~/.cargo/bin
+# 或 cargo build --release 后手动 cp target/release/herdr-freeze[.exe] 到 PATH 目录。
+# 之后再 `herdr plugin link ./herdr-freeze`。link 不运行 build。
+
+id = "herdr-freeze"
+name = "Herdr Freeze"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Auto-freeze idle pane process trees to release memory, with a click-to-thaw tab overlay."
+platforms = ["windows", "linux", "macos"]
+
+# ───────────────────────── 启动钩子：常驻监控守护进程 ─────────────────────────
+# 会话恢复 + API socket 就绪后运行一次。长期常驻：周期轮询 pane revision 判定
+# 空闲、挂起进程树、弹蒙层、检测蒙层关闭后解冻。崩溃后 herdr 不会重启它；下次
+# 启动钩子运行时会先恢复上次残留的挂起进程（见 state 恢复逻辑）。
+[[startup]]
+platforms = ["windows", "linux", "macos"]
+command = ["herdr-freeze", "monitor"]
+
+# ───────────────────────── 手动动作 ─────────────────────────
+
+# 查看/设置当前 workspace 的冻结配置。无设置参数时打开交互式配置弹窗 config。
+[[actions]]
+id = "config"
+title = "Freeze: configure workspace"
+contexts = ["workspace"]
+platforms = ["windows", "linux", "macos"]
+command = ["herdr-freeze", "config"]
+
+# 立即冻结当前 tab 的所有 pane（手动触发，不等空闲阈值；仍受 workspace 是否开启限制）。
+[[actions]]
+id = "freeze-now"
+title = "Freeze: freeze current tab now"
+contexts = ["workspace", "pane"]
+platforms = ["windows", "linux", "macos"]
+command = ["herdr-freeze", "freeze-now"]
+
+# 手动解冻当前 tab（与点击蒙层等价；写解冻信号，守护进程下一轮处理）。
+[[actions]]
+id = "thaw"
+title = "Freeze: thaw current tab"
+contexts = ["workspace", "pane"]
+platforms = ["windows", "linux", "macos"]
+command = ["herdr-freeze", "thaw"]
+
+# ───────────────────────── 冻结蒙层 pane ─────────────────────────
+# 当某 tab 下全部 pane 冻结时，守护进程通过 plugin pane open 打开本入口点。
+# placement = overlay：在活动 pane 上方打开临时缩放覆盖层（覆盖整个 tab 区域）。
+# 该进程进入 raw 模式、清屏绘制「❄ 已冻结 · 按任意键恢复整个 tab」，读 stdin
+# 阻塞，收到任意按键字节即退出 → herdr 关闭该 pane → 守护进程检测到 pane
+# 关闭后解冻整个 tab。
+# （只支持按键解冻：herdr 0.9 本地 shell 模式不把鼠标事件转发给 pane 程序）
+[[panes]]
+id = "frozen"
+title = "Frozen"
+placement = "overlay"
+platforms = ["windows", "linux", "macos"]
+command = ["herdr-freeze", "frozen"]
+
+# workspace 冻结配置交互弹窗（config 动作在无设置参数时打开）。
+[[panes]]
+id = "config"
+title = "Freeze settings"
+placement = "popup"
+platforms = ["windows", "linux", "macos"]
+command = ["herdr-freeze", "config-ui"]
