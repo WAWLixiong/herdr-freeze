@@ -1,26 +1,29 @@
 # herdr-freeze
 
-自动冻结 Herdr 空闲面板进程树以释放内存，整个标签页全部冻结时弹出
-「❄ 已冻结 · 按任意键恢复」蒙层，按键即解冻整个标签页。
+自动冻结 Herdr 空闲面板进程树以释放内存。冻结 = 挂起进程树 + 裁剪工作集 +
+给 pane label 加 `❄` 前缀；解冻 = 用户聚焦到冻结 pane 时即时恢复该单 pane。
 
 这是一个 [Herdr](https://herdr.dev) 插件（目录 + `herdr-plugin.toml` 清单 +
-一个 Rust 二进制 `herdr-freeze`）。冻结/解冻逻辑参考了 `work-assistant` 的
-freezer（挂起进程树 + 裁剪工作集），并适配到 Herdr 的 pane/tab/workspace 模型。
+一个 Rust 二进制 `herdr-freeze`）。冻结/解冻逻辑参考 `work-assistant` 的
+freezer（挂起进程树 + 裁剪工作集），空闲检测适配 work-assistant 的 PTY
+时间戳方案——herdr-freeze 不拥有 PTY（herdr 拥有），改用**进程组 CPU 采样**
+替代 PTY 输出信号，覆盖所有运行的进程（含无终端输出的 CPU-bound 进程）。
 
 ## 行为
 
-- **空闲判定**：守护进程周期轮询每个 pane 的 `content_revision`（`pane list`
-  返回）。某 pane 的 revision 在阈值秒内未变化 → 视为空闲（agent 没在产出）。
-  `pane.output_changed` 属高频事件，不在 Herdr 插件清单事件钩子内，故采用轮询。
-- **冻结**：空闲 pane 通过 `pane process-info` 取前台进程 pid/进程组，挂起整棵
-  进程树并裁剪工作集（释放物理内存）。冻结的 pane 标题前加 `❄` 标记。
-- **蒙层**：当某 tab 下**所有** pane 都冻结时，对**当前聚焦的**该 tab 弹出一个
-  `overlay` 插件 pane（缩放覆盖整个 tab 区域），进入 raw 模式、绘制「❄ 已冻结 ·
-  按任意键恢复整个 tab」。非聚焦的全冻结 tab 暂不弹蒙层，等用户切到它时下一轮再弹
-  （避免抢焦点）。部分冻结的 tab 只挂起 + 加 ❄ 标记，不弹蒙层。
-- **解冻**：用户在蒙层上**按任意键** → 蒙层进程退出 → herdr 关闭该 overlay pane
-  → 守护进程检测到 pane 关闭 → 恢复该 tab 全部冻结进程、还原标签、设冷却期
-  （避免立刻再冻结）。
+- **空闲判定**：守护进程周期（15s）采样每 pane 进程组/树的总 CPU 时间
+  （Windows `GetProcessTimes` 树求和；Linux `/proc/[pid]/stat` 遍历进程组
+  求和 utime+stime；macOS `proc_pidinfo(PROC_PIDTASKINFO)` 求和
+  `total_user+total_system`）。CPU 时间 delta>0 → 进程在跑 → 刷新活动时刻。
+  revision 变化（`pane list` 已带，零额外 spawn）→ title/agent 变 → 也视为
+  活动，跳过 CPU 采样（省 `pane process-info` spawn）。
+- **冻结**：CPU 不变达阈值秒（默认 180s）且未被聚焦达 60s（grace）→ 候选
+  → 400ms CPU guard（>10% 一核则跳过本轮，复刻 work-assistant）→ 挂起整棵
+  进程树并裁剪工作集。冻结的 pane 标题前加 `❄` 标记。
+- **解冻**：守护进程常驻订阅 herdr 的 `pane.focused` + `tab.focused` 事件流
+  （`events.subscribe`，socket 长连接，0 进程 spawn）。用户聚焦到冻结 pane
+  → 即时 resume 该单 pane + 还原 label + 设该 tab 冷却（防立刻再冻结）。
+  `tab.focused` 作兜底（payload 无 pane_id，查该 tab 当前聚焦 pane）。
 - **配置**：按 Herdr workspace 级别，用 workspace 元数据 token 存储：
   - `freeze_enabled`（`true`/`false`，默认 `true`）
   - `freeze_idle_secs`（秒，默认 `180`，下限 `30`）
@@ -30,19 +33,59 @@ freezer（挂起进程树 + 裁剪工作集），并适配到 Herdr 的 pane/tab
 
 - **Windows**：复刻 work-assistant freezer —— `NtSuspendProcess`/`NtResumeProcess`
   挂起/恢复整棵进程树（`CreateToolhelp32Snapshot` 遍历父子关系 + BFS，含竞态修复
-  轮次），`K32EmptyWorkingSet` 裁剪工作集。完整进程树冻结。
+  轮次），`K32EmptyWorkingSet` 裁剪工作集。CPU 采样用 `GetProcessTimes` 树求和
+  （user+kernel 100ns ticks）。
 - **Unix / macOS**：对 herdr 给出的前台进程组 id 发 `SIGSTOP`/`SIGCONT`（整组），
-  覆盖 agent 及同组子孙；跨进程组派生的子孙不在范围内（macOS 无 `/proc` 树遍历，
-  MVP 以进程组为准）。
+  覆盖 agent 及同组子孙。CPU 采样：Linux 遍历 `/proc/[pid]/stat` 按 pgrp 匹配
+  求和 utime+stime（jiffies，假定 CLK_TCK=100）；macOS 对 `foreground_processes`
+  逐 pid `proc_pidinfo(PROC_PIDTASKINFO)` 取 `total_user+total_system`（ns）。
+  跨进程组派生的子孙不在冻结/采样范围内（macOS 无 `/proc` 树遍历，MVP 以进程组为准）。
 
 守护进程只持久化「根 pid + 进程组 id」；恢复时按 pid 重新遍历进程树再开句柄解挂
 —— 这样守护进程崩溃重启后也能按 pid 恢复上次残留的挂起进程。
 
+## 安装（从预编译二进制，无需 Rust 工具链）
+
+适合没有 Rust 编辑环境的用户。**二进制靠 PATH 解析、`herdr-plugin.toml`
+靠 link 目录——两者缺一不可。**
+
+1. 从 [Releases](../../releases) 页下载对应平台的二进制：
+   - Linux：`herdr-freeze-x86_64-unknown-linux-gnu`
+   - macOS（Intel）：`herdr-freeze-x86_64-apple-darwin`
+   - macOS（Apple Silicon）：`herdr-freeze-aarch64-apple-darwin`
+   - Windows：`herdr-freeze-x86_64-pc-windows-msvc.exe`
+2. 把二进制重命名为 `herdr-freeze`（Windows 保留 `.exe`），放到 **PATH** 上的目录：
+   ```sh
+   # Linux/macOS（任选一个在 PATH 上的目录）
+   mkdir -p ~/.local/bin
+   mv herdr-freeze-* ~/.local/bin/herdr-freeze
+   chmod +x ~/.local/bin/herdr-freeze
+   # 确认 ~/.local/bin 在 PATH；若不在，加到 ~/.zshrc / ~/.bashrc：
+   #   export PATH="$HOME/.local/bin:$PATH"
+
+   # Windows：重命名为 herdr-freeze.exe，放到 PATH 目录
+   # （如 %USERPROFILE%\.cargo\bin 或自行添加的目录）
+   ```
+3. 单独下载 `herdr-plugin.toml`（Releases 同页提供），放到插件目录：
+   ```sh
+   mkdir -p ~/.config/herdr/plugins/herdr-freeze
+   # 把 herdr-plugin.toml 放到该目录
+   ```
+4. 链接并确认：
+   ```sh
+   herdr plugin link ~/.config/herdr/plugins/herdr-freeze
+   herdr plugin list                          # 确认 herdr-freeze 已注册、enabled
+   herdr plugin action list --plugin herdr-freeze
+   ```
+
+> 也可克隆本仓库用其 `herdr-plugin.toml`，二进制仍走 PATH。
+
 ## 安装（本地开发）
 
-herdr 不允许同 id 的 action/pane 按平台重复声明（`duplicate_plugin_action_id`），
-故清单用单一命令 + 纯名 `herdr-freeze`（herdr 在 Windows 上按 PATHEXT 解析
-`.exe`）。**需要先把 release 二进制放到 PATH**：
+需要 Rust 工具链。herdr 不允许同 id 的 action/pane 按平台重复声明
+（`duplicate_plugin_action_id`），故清单用单一命令 + 纯名 `herdr-freeze`
+（herdr 在 Windows 上按 PATHEXT 解析 `.exe`）。**需要先把 release 二进制
+放到 PATH**：
 
 ```sh
 # 方式一：cargo install（装到 ~/.cargo/bin，该目录通常在 PATH 上）
@@ -63,8 +106,20 @@ herdr plugin action list --plugin herdr-freeze
 ```
 
 链接后，**下次 herdr 会话恢复**时启动钩子会自动拉起监控守护进程（`herdr-freeze
-monitor`）。启动钩子是一次性的、**非受监督**守护进程：若它崩溃，herdr 不会重启它，
-需重开会话/重启 herdr 服务器才会再次运行（启动时会先恢复上次残留的挂起进程）。
+monitor`）。守护进程启动时：连 `HERDR_SOCKET_PATH`（startup hook 注入）订阅
+`pane.focused`/`tab.focused` 事件流，并先恢复上次残留的挂起进程。
+
+进程生命周期与 herdr 绑定：
+- **herdr 退出 → monitor 自动退出**：monitor 检测 socket 文件消失
+  （herdr 退出时 `cleanup_sockets` 删除 socket 文件）→ 立即自杀，不留孤儿。
+  累计重连失败超 60s 也兜底自杀（防 herdr 异常崩溃未 cleanup）。
+- **herdr 重启 → monitor 重启**：herdr 会话恢复时 startup hook 重新拉起
+  monitor（旧 monitor 已随 herdr 退出自杀，无双开）。
+- **多个 herdr 客户端 → 1 个 monitor**：startup hook 只在服务器（会话）启动时
+  跑一次，不在客户端 attach 时重跑。同一会话的多客户端共享 1 个 monitor；
+  不同会话（`HERDR_SESSION`）各自 1 个 monitor，靠 `HERDR_SOCKET_PATH` 隔离。
+- 启动钩子**非受监督**：monitor 自身崩溃（非 herdr 退出）时 herdr 不会重启它，
+  需重开会话才会再次运行（启动会先恢复残留挂起进程）。
 
 ## 配置
 
@@ -86,9 +141,8 @@ herdr-freeze config --workspace w1 --clear      # 恢复默认
 
 - `herdr-freeze freeze-now`（动作 `freeze-now`）：立即冻结当前 tab 的所有 pane
   （不等空闲阈值；仍受该 workspace 是否开启冻结限制）。
-- `herdr-freeze thaw`（动作 `thaw`）：手动解冻当前 tab（与在蒙层按键等价）。
-- `herdr-freeze frozen`：冻结蒙层 UI（由守护进程通过 `plugin pane open` 打开，
-  一般不直接调用）。
+- `herdr-freeze thaw`（动作 `thaw`）：手动解冻当前 tab（与聚焦解冻等价，但整 tab；
+  直接读 `frozen.json` resume，不依赖守护进程在跑）。
 - `herdr-freeze config-ui`：配置弹窗 UI（由 `config` 动作打开）。
 
 ## 调试
@@ -99,8 +153,8 @@ herdr-freeze config --workspace w1 --clear      # 恢复默认
 herdr plugin log list --plugin herdr-freeze
 ```
 
-手动单跑监控（仅做非冻结的一轮校验时可短跑后 Ctrl-C；首个 tick 会把所有 pane 的
-last_change 置为现在，故 180s 内不会冻结）：
+手动单跑监控（Ctrl-C 退出；首个 tick 初始化各 pane 的 CPU 采样基线，故
+idle_secs 内不会冻结）：
 
 ```sh
 herdr-freeze monitor   # Ctrl-C 退出
@@ -110,25 +164,31 @@ herdr-freeze monitor   # Ctrl-C 退出
 
 ```text
 herdr-freeze/
-  herdr-plugin.toml     # 清单：startup / actions(config,freeze-now,thaw) / panes(frozen,config)
+  herdr-plugin.toml     # 清单：startup / actions(config,freeze-now,thaw) / pane(config)
   Cargo.toml
   src/
-    main.rs             # 子命令分发：monitor/frozen/config/config-ui/thaw/freeze-now
-    monitor.rs          # 常驻守护进程：轮询 + 空闲判定 + 冻结 + 蒙层 + 解冻 + 恢复
+    main.rs             # 子命令分发：monitor/config/config-ui/thaw/freeze-now
+    monitor.rs          # 常驻守护进程：CPU 采样空闲判定 + socket 聚焦解冻 + 冻结/恢复
+    event_stream.rs     # herdr socket 长连接订阅 pane.focused/tab.focused（events.subscribe）
+    cpu_sample.rs       # 跨平台进程组/树 CPU 采样（GetProcessTimes / /proc / proc_pidinfo）
     api.rs              # herdr CLI 封装（HERDR_BIN_PATH）+ JSON 信封解析
     freezer.rs          # 跨平台进程树挂起/恢复（Windows NtSuspend / Unix SIGSTOP）
-    overlay.rs          # 冻结蒙层 UI
     state.rs            # 持久化冻结记录 + thaw/freeze-now 信号
 ```
 
 ## 限制 / 注意
 
-- **只支持按键解冻**：herdr 0.9 本地 shell 模式下不把鼠标事件转发给 pane 程序
-  （按键会转发），故蒙层用 raw 模式 + 读 stdin，任意按键即解冻；未开鼠标追踪。
+- **解冻靠聚焦事件**：守护进程常驻订阅 `pane.focused`/`tab.focused`，聚焦冻结 pane
+  即解冻该单 pane。守护进程不在时（崩溃）聚焦无法解冻——用 `thaw` CLI 兜底（直接读
+  `frozen.json` resume，不依赖守护进程），或下次会话启动钩子重启守护进程时恢复残留。
+- **CPU 采样覆盖所有运行进程**：无终端输出的 CPU-bound 进程（如 `cargo build`）也能
+  被检测为活跃（CPU delta>0），不会被误冻结。但纯 I/O 等待（CPU 低且无输出）的进程
+  仍可能被判空闲——这是 work-assistant 方案共有的局限。
 - 默认所有 workspace 冻结**开启**；不希望的 workspace 用 `config --enabled false` 关闭。
-- 蒙层只在「tab 下全部 pane 冻结」且「该 tab 为当前聚焦 tab」时弹出；非聚焦的全冻结
-  tab 仅显示 ❄ 标题，切到它后下一轮（≤10s）弹蒙层。
-- Unix/macOS 用进程组 `SIGSTOP`；跨进程组派生的子孙不会被挂起。
+- Unix/macOS 用进程组 `SIGSTOP`；跨进程组派生的子孙不会被挂起/采样。
+- macOS CPU 采样只采 herdr 给的 `foreground_processes`（agent 实体），不遍历整个进程组
+  （需 `PROC_PIDTBSDINFO` 查 `pbi_pgid`，struct layout 复杂易错；foreground_pids 已是
+  活动主体）。
 - workspace 元数据 token 有 ttl（24h），守护进程每小时续期一次；若守护进程长期不跑，
   配置会回退默认值。
 - 启动钩子非受监督；崩溃后需重开会话才会再次运行（启动会先恢复残留挂起进程）。

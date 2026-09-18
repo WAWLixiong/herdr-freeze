@@ -77,7 +77,6 @@ fn run_ok(args: &[&str]) -> Result<(), String> {
 pub struct Workspace {
     pub workspace_id: String,
     pub label: String,
-    pub active_tab_id: String,
     pub tokens: std::collections::HashMap<String, String>,
 }
 
@@ -97,11 +96,6 @@ pub fn workspace_list() -> Result<Vec<Workspace>, String> {
                 .to_string(),
             label: ws
                 .get("label")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            active_tab_id: ws
-                .get("active_tab_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
@@ -207,11 +201,6 @@ pub fn pane_list(workspace_id: &str) -> Result<Vec<Pane>, String> {
     Ok(out)
 }
 
-/// pane 是否存在（用于检测蒙层 pane 是否被关闭）。
-pub fn pane_exists(pane_id: &str) -> bool {
-    run_json(&["pane", "get", pane_id]).is_ok()
-}
-
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
     pub shell_pid: Option<u32>,
@@ -258,36 +247,22 @@ pub fn pane_set_label(pane_id: &str, label: Option<&str>) -> Result<(), String> 
 
 // =============================== plugin pane ===============================
 
-/// 打开插件 pane（冻结蒙层 / 配置弹窗）。返回新建 pane 的 pane_id。
-/// target_pane 非空时指定蒙层覆盖到该 pane 所在 tab（overlay 是缩放覆盖，会覆盖整个 tab 区域）；
-/// 为空时省略 --target-pane（popup 不需要，overlay 则覆盖活动 pane）。
-pub fn plugin_pane_open(
-    plugin_id: &str,
-    entrypoint: &str,
-    placement: &str,
-    workspace_id: &str,
-    target_pane: &str,
-) -> Result<String, String> {
-    let mut args: Vec<String> = vec![
-        "plugin".into(),
-        "pane".into(),
-        "open".into(),
-        "--plugin".into(),
-        plugin_id.into(),
-        "--entrypoint".into(),
-        entrypoint.into(),
-        "--placement".into(),
-        placement.into(),
-        "--workspace".into(),
-        workspace_id.into(),
+/// 打开插件 pane（config-ui 配置弹窗）。overlay/popup 都「target the active
+/// pane」——herdr 拒绝 --workspace/--target-pane（invalid_params），故此处
+/// 不传，由 herdr 用当前活动 pane/workspace 打开。返回新建 pane 的 pane_id。
+pub fn plugin_pane_open(plugin_id: &str, entrypoint: &str, placement: &str) -> Result<String, String> {
+    let refs = &[
+        "plugin",
+        "pane",
+        "open",
+        "--plugin",
+        plugin_id,
+        "--entrypoint",
+        entrypoint,
+        "--placement",
+        placement,
     ];
-    if !target_pane.is_empty() {
-        args.push("--target-pane".into());
-        args.push(target_pane.into());
-    }
-    args.push("--no-focus".into());
-    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let result = run_json(&refs)?;
+    let result = run_json(refs)?;
     let pane_id = result
         .get("plugin_pane")
         .and_then(|v| v.get("pane"))
@@ -296,11 +271,6 @@ pub fn plugin_pane_open(
         .ok_or_else(|| format!("plugin pane open: missing plugin_pane.pane.pane_id: {result}"))?
         .to_string();
     Ok(pane_id)
-}
-
-/// 主动关闭插件 pane（解冻路径之一）。pane_id 是位置参数。
-pub fn plugin_pane_close(pane_id: &str) -> Result<(), String> {
-    run_ok(&["plugin", "pane", "close", pane_id])
 }
 
 fn token_map(value: Option<&serde_json::Value>) -> std::collections::HashMap<String, String> {

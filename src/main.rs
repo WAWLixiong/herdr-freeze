@@ -1,16 +1,22 @@
 //! herdr-freeze 插件二进制入口。子命令：
 //!   monitor     —— 常驻监控守护进程（启动钩子）
-//!   frozen      —— 冻结蒙层 UI（插件 pane 入口点）
 //!   config      —— 查看/设置当前 workspace 的冻结配置（动作）
 //!                  无设置参数时打开交互式配置弹窗 config-ui
 //!   config-ui   —— 交互式配置弹窗（插件 pane 入口点）
 //!   thaw        —— 手动解冻当前 tab（写解冻信号，守护进程处理）
 //!   freeze-now  —— 立即冻结当前 tab（写信号，守护进程处理）
+//!
+//! 冻结/解冻逻辑：守护进程常驻订阅 herdr 的 pane.focused/tab.focused 事件流
+//! （events.subscribe，socket 长连接），空闲判定靠进程组 CPU 采样 + 聚焦
+//! 60s grace（适配 work-assistant 的 PTY 时间戳方案——herdr-freeze 不拥有
+//! PTY，用 CPU 采样替代 PTY 输出信号）。冻结 = 挂起进程树 + label 加 ❄；
+//! 解冻 = 聚焦到冻结 pane 即时恢复该单 pane。
 
 mod api;
+mod cpu_sample;
+mod event_stream;
 mod freezer;
 mod monitor;
-mod overlay;
 mod state;
 
 use std::io::Write;
@@ -18,24 +24,136 @@ use std::io::Write;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(|s| s.as_str()) {
-        None => {
-            eprintln!(
-                "usage: herdr-freeze <monitor|frozen|config|config-ui|thaw|freeze-now> [args]"
-            );
-            2
+        None | Some("--help") | Some("-h") => {
+            print_help();
+            0
         }
-        Some("monitor") => monitor::Monitor::run(),
-        Some("frozen") => overlay::run(),
-        Some("config") => config_cmd(&args[1..]),
-        Some("config-ui") => config_ui(),
-        Some("thaw") => thaw_cmd(&args[1..]),
-        Some("freeze-now") => freeze_now_cmd(&args[1..]),
+        Some("monitor") => {
+            if wants_help(&args[1..]) {
+                print_monitor_help();
+                0
+            } else {
+                monitor::Monitor::run()
+            }
+        }
+        Some("config") => {
+            if wants_help(&args[1..]) {
+                print_config_help();
+                0
+            } else {
+                config_cmd(&args[1..])
+            }
+        }
+        Some("config-ui") => {
+            if wants_help(&args[1..]) {
+                print_config_ui_help();
+                0
+            } else {
+                config_ui()
+            }
+        }
+        Some("thaw") => {
+            if wants_help(&args[1..]) {
+                print_thaw_help();
+                0
+            } else {
+                thaw_cmd(&args[1..])
+            }
+        }
+        Some("freeze-now") => {
+            if wants_help(&args[1..]) {
+                print_freeze_now_help();
+                0
+            } else {
+                freeze_now_cmd(&args[1..])
+            }
+        }
         Some(other) => {
-            eprintln!("unknown subcommand: {other}");
+            eprintln!(
+                "unknown subcommand: {other}\n\nRun 'herdr-freeze --help' for usage."
+            );
             2
         }
     };
     std::process::exit(code);
+}
+
+fn wants_help(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--help" || a == "-h")
+}
+
+fn print_help() {
+    println!("herdr-freeze {} - Auto-freeze idle Herdr panes to release memory\n", env!("CARGO_PKG_VERSION"));
+    println!("USAGE:");
+    println!("    herdr-freeze <SUBCOMMAND> [OPTIONS]\n");
+    println!("SUBCOMMANDS:");
+    println!("    monitor       常驻监控守护进程（由 herdr startup hook 拉起，通常不手动运行）");
+    println!("    config        查看/设置 workspace 冻结配置");
+    println!("    config-ui     交互式配置弹窗（由 config 动作打开，不手动运行）");
+    println!("    thaw          手动解冻当前 tab 的所有冻结 pane");
+    println!("    freeze-now    立即冻结当前 tab 的所有 pane（不等空闲阈值）\n");
+    println!("OPTIONS:");
+    println!("    -h, --help    打印本帮助或子命令帮助\n");
+    println!("冻结机制：CPU 采样判空闲 + 挂起进程树；聚焦冻结 pane 即时解冻。");
+    println!("见 README.md 或 https://herdr.dev 了解详情。");
+}
+
+fn print_monitor_help() {
+    println!("herdr-freeze monitor - 常驻监控守护进程\n");
+    println!("USAGE:");
+    println!("    herdr-freeze monitor\n");
+    println!("由 herdr startup hook 在会话恢复时拉起。常驻：周期（15s）采样每 pane");
+    println!("进程组 CPU 时间判空闲，挂起空闲进程树；订阅 pane.focused/tab.focused");
+    println!("事件流，聚焦冻结 pane 即时解冻。herdr 退出时（socket 文件消失）");
+    println!("自动退出，不留孤儿。\n");
+    println!("手动运行（调试）：Ctrl-C 退出。首个 tick 初始化 CPU 采样基线，");
+    println!("idle_secs 内不会冻结。");
+}
+
+fn print_config_help() {
+    println!("herdr-freeze config - 查看/设置 workspace 冻结配置\n");
+    println!("USAGE:");
+    println!("    herdr-freeze config --workspace <ID> [OPTIONS]");
+    println!("    herdr-freeze config --workspace <ID> --clear\n");
+    println!("OPTIONS:");
+    println!("    --workspace <ID>    workspace id（或在工作区上下文里调用，省略）");
+    println!("    --enabled <BOOL>   true/false（默认 true，开启自动冻结）");
+    println!("    --idle-secs <N>    空闲阈值秒（默认 180，下限 30）");
+    println!("    --clear            清除配置，恢复默认\n");
+    println!("无设置参数时：作为 herdr 动作调用打开交互弹窗；CLI 调用打印当前配置。\n");
+    println!("示例:");
+    println!("    herdr-freeze config --workspace w1 --enabled true --idle-secs 120");
+    println!("    herdr-freeze config --workspace w1            # 查看当前配置");
+    println!("    herdr-freeze config --workspace w1 --clear     # 恢复默认");
+}
+
+fn print_config_ui_help() {
+    println!("herdr-freeze config-ui - 交互式配置弹窗\n");
+    println!("USAGE:");
+    println!("    herdr-freeze config-ui\n");
+    println!("由 config 动作（无设置参数时）经 plugin pane open 打开，不手动运行。");
+    println!("弹窗内交互设置 enabled / idle-secs。");
+}
+
+fn print_thaw_help() {
+    println!("herdr-freeze thaw - 手动解冻当前 tab\n");
+    println!("USAGE:");
+    println!("    herdr-freeze thaw [--tab <ID>]\n");
+    println!("OPTIONS:");
+    println!("    --tab <ID>    tab id（或在 tab 上下文里调用，省略）\n");
+    println!("解冻该 tab 所有冻结 pane（恢复进程 + 还原标签）。直接读 frozen.json");
+    println!("resume，不依赖监控守护进程在跑——守护进程崩溃时这是兜底解冻方式。");
+    println!("与聚焦解冻等价，但整 tab 粒度。");
+}
+
+fn print_freeze_now_help() {
+    println!("herdr-freeze freeze-now - 立即冻结当前 tab\n");
+    println!("USAGE:");
+    println!("    herdr-freeze freeze-now [--tab <ID>]\n");
+    println!("OPTIONS:");
+    println!("    --tab <ID>    tab id（或在 tab 上下文里调用，省略）\n");
+    println!("立即冻结该 tab 所有 pane（不等空闲阈值；仍受 workspace 是否开启冻结");
+    println!("限制）。写信号，由监控守护进程下一轮处理（需守护进程在跑）。");
 }
 
 // =============================== 上下文 ===============================
@@ -168,9 +286,9 @@ fn config_cmd(args: &[String]) -> i32 {
 
     // 无设置参数：作为动作调用时打开交互式配置弹窗；否则打印当前配置
     if std::env::var("HERDR_PLUGIN_ACTION_ID").is_ok() {
-        // 打开 config-ui 弹窗
-        let target = read_context().pane_id.unwrap_or_default();
-        match api::plugin_pane_open("herdr-freeze", "config", "popup", &workspace_id, &target) {
+        // 打开 config-ui 弹窗（popup 由 herdr 用当前活动 pane/workspace 打开，
+        // 不传 --workspace/--target-pane——overlay/popup 均拒绝它们）。
+        match api::plugin_pane_open("herdr-freeze", "config", "popup") {
             Ok(_) => return 0,
             Err(e) => {
                 eprintln!("config: 打开配置弹窗失败: {e}");

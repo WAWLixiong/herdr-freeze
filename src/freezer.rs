@@ -95,7 +95,7 @@ mod windows_impl {
     }
 
     /// 遍历整棵进程树：以 roots 为起点，BFS 收集所有后代 pid。
-    fn tree_pids(roots: &[u32]) -> Vec<u32> {
+    pub(crate) fn tree_pids(roots: &[u32]) -> Vec<u32> {
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if snap == 0 || snap == INVALID_HANDLE {
@@ -204,6 +204,20 @@ fn freeze_tree_windows(roots: &[u32]) -> Vec<u32> {
 #[cfg(windows)]
 fn resume_tree_windows(roots: &[u32]) -> bool {
     windows_impl::resume_tree(roots)
+}
+
+/// 进程树 pid 列表（Windows BFS；Unix 返回 roots 本身——Unix 冻结用进程组
+/// SIGSTOP，CPU 采样在 Unix 也用进程组遍历而非树）。供 cpu_sample 复用，
+/// 避免 cpu_sample 重复实现 Windows 的进程树 BFS。
+pub(crate) fn tree_pids(roots: &[u32]) -> Vec<u32> {
+    #[cfg(windows)]
+    {
+        windows_impl::tree_pids(roots)
+    }
+    #[cfg(not(windows))]
+    {
+        roots.to_vec()
+    }
 }
 
 // =============================== Unix ===============================

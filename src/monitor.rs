@@ -1,58 +1,72 @@
-//! 常驻监控守护进程：周期轮询 pane revision 判定空闲，挂起空闲 pane 的进程树，
-//! 整个 tab 全部冻结时弹出蒙层，蒙层关闭后解冻整个 tab。
+//! 常驻监控守护进程：CPU 采样判空闲 + socket 订阅聚焦事件即时解冻。
 //!
-//! 与 herdr 的交互全部走 HERDR_BIN_PATH CLI（一次性请求），不持有常驻 socket。
-//! 空闲判定：pane.read 给出的 content_revision 在阈值秒内未变化即视为空闲
-//! （用户选定方案；pane.output_changed 属高频事件，不在插件清单事件钩子内）。
-//! 配置：herdr workspace 元数据 token（freeze_enabled / freeze_idle_secs）。
+//! 空闲判定（适配 work-assistant 的 PTY 时间戳方案——herdr-freeze 不拥有
+//! PTY，用进程 CPU 采样替代 PTY 输出信号）：
+//! - 周期（15s）采样每 pane 进程组/树总 CPU 时间；delta>0 → 有活动，刷新
+//!   last_cpu。覆盖所有运行的进程（含无终端输出的 CPU-bound 进程）。
+//! - revision 变（pane list 已带，零额外 spawn）→ title/agent 变 → 视为活动，
+//!   刷新 last_active，跳过 CPU 采样（省 process-info spawn）。
+//! - 空闲 = cpu_idle ≥ idle_secs AND active_idle ≥ 60s → 候选 → 400ms CPU
+//!   guard（>10% 一核则跳过本轮，下轮重试，复刻 work-assistant）→ freeze_pane。
+//!
+//! 解冻（单 pane，即时）：订阅 pane.focused + tab.focused（socket 长连接，
+//! events.subscribe，0 spawn）；聚焦冻结 pane → 即时 resume + 去 ❄ + 设冷却。
+//!
+//! 与 herdr 的其余交互（workspace list / pane list / process-info / pane
+//! rename / report-metadata）仍走 HERDR_BIN_PATH CLI 一次性调用。配置以 herdr
+//! workspace 元数据 token 存储（freeze_enabled / freeze_idle_secs）。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::api;
+use crate::cpu_sample;
+use crate::event_stream::{self, FocusEvent};
 use crate::freezer::{self, FreezeTarget};
 use crate::state::{self, FrozenEntry};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(10);
+const POLL_INTERVAL: Duration = Duration::from_secs(15);
 const COOLDOWN: Duration = Duration::from_secs(90);
+const ACTIVE_GRACE: Duration = Duration::from_secs(60);
 const METADATA_REFRESH: Duration = Duration::from_secs(3600);
-const METADATA_TTL_MS: u64 = 86_400_000; // 24h（schema 上限）
+const METADATA_TTL_MS: u64 = 86_400_000;
 const DEFAULT_IDLE_SECS: u64 = 180;
 const MIN_IDLE_SECS: u64 = 30;
+const CPU_GUARD_MS: u64 = 400;
+const CPU_BUSY_RATIO: f64 = 0.10;
 const MARKER: &str = "❄ ";
-
-#[derive(Clone)]
-#[allow(dead_code)]
-struct Overlay {
-    workspace_id: String,
-    tab_id: String,
-    pane_id: String,
-}
 
 pub struct Monitor {
     frozen: Vec<FrozenEntry>,
-    overlays: Vec<Overlay>,
-    /// pane_id -> (上次 revision, 上次变化时刻)
-    last_change: HashMap<String, (u64, Instant)>,
+    /// pane_id -> (上次 CPU 采样值, 上次活动时刻)
+    last_cpu: HashMap<String, (cpu_sample::CpuTime, Instant)>,
+    /// pane_id -> 上次聚焦时刻（60s grace）
+    last_active: HashMap<String, Instant>,
+    /// pane_id -> 上次 revision（便宜初筛，省 process-info spawn）
+    last_rev: HashMap<String, u64>,
     cooldown: HashMap<String, Instant>,
     last_md_refresh: Instant,
-}
-
-impl Default for Monitor {
-    fn default() -> Self {
-        Self {
-            frozen: Vec::new(),
-            overlays: Vec::new(),
-            last_change: HashMap::new(),
-            cooldown: HashMap::new(),
-            last_md_refresh: Instant::now() - METADATA_REFRESH, // 启动后尽快续期一次
-        }
-    }
+    focus_rx: mpsc::Receiver<FocusEvent>,
 }
 
 impl Monitor {
+    fn new(focus_rx: mpsc::Receiver<FocusEvent>) -> Self {
+        Self {
+            frozen: Vec::new(),
+            last_cpu: HashMap::new(),
+            last_active: HashMap::new(),
+            last_rev: HashMap::new(),
+            cooldown: HashMap::new(),
+            last_md_refresh: Instant::now() - METADATA_REFRESH, // 启动后尽快续期一次
+            focus_rx,
+        }
+    }
+
     pub fn run() -> i32 {
-        let mut m = Monitor::default();
+        let (tx, rx) = mpsc::channel();
+        let _reader = event_stream::spawn_reader(tx);
+        let mut m = Monitor::new(rx);
         // 启动恢复：上次崩溃残留的挂起进程，按 pid 全部解挂，清空记录。
         let leftover = state::load_frozen();
         if !leftover.is_empty() {
@@ -78,9 +92,19 @@ impl Monitor {
     }
 
     fn tick(&mut self) -> Result<(), String> {
-        // 1) 处理手动信号
+        let now = Instant::now();
+
+        // 1) 处理聚焦事件（socket 订阅）：聚焦冻结 pane → 即时解冻；无论如何
+        //    刷新 last_active（60s grace，防冻结用户正在看的 pane）。
+        while let Ok(ev) = self.focus_rx.try_recv() {
+            match ev {
+                FocusEvent::Pane(pid) => self.on_focus(&pid, now),
+                FocusEvent::Tab(tid, wid) => self.on_tab_focus(&tid, &wid, now),
+            }
+        }
+
+        // 2) 处理手动信号
         for tab_id in state::drain_freeze_now_requests() {
-            // 立即冻结该 tab 下所有未冻结 pane（受 enable 限制，不受 idle 限制）
             self.force_freeze_tab(&tab_id);
         }
         for tab_id in state::drain_thaw_requests() {
@@ -89,7 +113,7 @@ impl Monitor {
 
         let workspaces = api::workspace_list()?;
 
-        // 2) 元数据续期（配置 token ttl=24h，每小时续一次）
+        // 3) 元数据续期（配置 token ttl=24h，每小时续一次）
         if self.last_md_refresh.elapsed() >= METADATA_REFRESH {
             for ws in &workspaces {
                 let tokens = &ws.tokens;
@@ -113,8 +137,6 @@ impl Monitor {
             self.last_md_refresh = Instant::now();
         }
 
-        let now = Instant::now();
-
         for ws in &workspaces {
             let enabled = ws
                 .tokens
@@ -130,12 +152,10 @@ impl Monitor {
 
             let panes = api::pane_list(&ws.workspace_id)?;
 
-            // 清理已消失 pane 的追踪状态与冻结记录（进程随 pane 关闭已被 herdr 回收，
-            // 但若曾被挂起，best-effort 解挂避免孤儿挂起进程）
+            // 清理已消失 pane 的追踪状态与冻结记录（best-effort 解挂避免孤儿）
             self.reap_closed_panes(&panes);
 
             if !enabled {
-                // 该 workspace 关闭冻结：解冻其所有冻结记录
                 let ws_frozen: Vec<String> = self
                     .frozen
                     .iter()
@@ -148,55 +168,72 @@ impl Monitor {
                 continue;
             }
 
-            // 更新 last_change：revision 变化即视为有活动
-            for p in &panes {
-                let prev = self.last_change.get(&p.pane_id);
-                match prev {
-                    Some((rev, _)) if *rev == p.revision => {
-                        // 无变化，保留原时刻
-                    }
-                    _ => {
-                        // 首次见到 或 revision 变化 → 重置为现在
-                        self.last_change
-                            .insert(p.pane_id.clone(), (p.revision, now));
-                    }
-                }
-            }
-
             // 冻结空闲 pane
             for p in &panes {
                 if self.is_frozen(&p.pane_id) {
                     continue;
                 }
-                // 排除我们自己打开的蒙层 pane（它本身不应被冻结/计数）
-                if self.overlays.iter().any(|o| o.pane_id == p.pane_id) {
-                    continue;
-                }
                 if self.in_cooldown(&p.tab_id, now) {
                     continue;
                 }
-                let Some((_, changed_at)) = self.last_change.get(&p.pane_id) else {
-                    continue;
-                };
-                if now.duration_since(*changed_at) < Duration::from_secs(idle_secs) {
+
+                // revision 便宜初筛（pane list 已带，零额外 spawn）：变 → 活动
+                if self.last_rev.get(&p.pane_id).copied() != Some(p.revision) {
+                    self.last_rev.insert(p.pane_id.clone(), p.revision);
+                    self.last_active.insert(p.pane_id.clone(), now);
                     continue;
                 }
-                self.freeze_pane(p);
+
+                // revision 不变 → process-info + CPU 采样确认
+                let info = match api::pane_process_info(&p.pane_id) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        eprintln!("[herdr-freeze] process-info {} 失败: {e}", p.pane_id);
+                        continue;
+                    }
+                };
+                let roots = if !info.foreground_pids.is_empty() {
+                    info.foreground_pids.clone()
+                } else if let Some(shell) = info.shell_pid {
+                    vec![shell]
+                } else {
+                    Vec::new()
+                };
+                let cur = cpu_sample::sample(&roots, info.foreground_process_group_id);
+                let prev = self.last_cpu.get(&p.pane_id).copied();
+                let active = prev.is_none() || cur != prev.unwrap().0;
+                if active {
+                    self.last_cpu.insert(p.pane_id.clone(), (cur, now));
+                    continue;
+                }
+                // CPU 不变 → 检查空闲时长 + 聚焦 grace
+                let cpu_idle_since = self
+                    .last_cpu
+                    .get(&p.pane_id)
+                    .map(|(_, t)| *t)
+                    .unwrap_or(now);
+                let active_since = self
+                    .last_active
+                    .get(&p.pane_id)
+                    .copied()
+                    .unwrap_or(cpu_idle_since);
+                if now.duration_since(cpu_idle_since) < Duration::from_secs(idle_secs) {
+                    continue;
+                }
+                if now.duration_since(active_since) < ACTIVE_GRACE {
+                    continue;
+                }
+                // 400ms CPU guard：>10% 一核 → 跳过本轮（下轮 sample 会捕到 CPU 增长）
+                if cpu_sample::busy_ratio(
+                    &roots,
+                    info.foreground_process_group_id,
+                    CPU_GUARD_MS,
+                ) > CPU_BUSY_RATIO
+                {
+                    continue;
+                }
+                self.freeze_pane(p, &info);
             }
-
-            // 全冻结 tab → 弹蒙层；非全冻结但蒙层已开 → 解冻
-            self.manage_overlays(ws, &panes);
-        }
-
-        // 3) 检测蒙层被关闭（用户点击/按键/手动关）→ 解冻对应 tab
-        let closed: Vec<String> = self
-            .overlays
-            .iter()
-            .filter(|o| !api::pane_exists(&o.pane_id))
-            .map(|o| o.tab_id.clone())
-            .collect();
-        for tab_id in closed {
-            self.thaw_tab(&tab_id);
         }
 
         state::save_frozen(&self.frozen);
@@ -211,14 +248,27 @@ impl Monitor {
         self.cooldown.get(tab_id).is_some_and(|t| *t > now)
     }
 
-    fn freeze_pane(&mut self, p: &api::Pane) {
-        let info = match api::pane_process_info(&p.pane_id) {
-            Ok(i) => i,
-            Err(e) => {
-                eprintln!("[herdr-freeze] process-info {} 失败: {e}", p.pane_id);
-                return;
-            }
+    /// 聚焦事件：若该 pane 冻结 → 即时解冻；无论如何刷新 last_active。
+    fn on_focus(&mut self, pane_id: &str, now: Instant) {
+        if self.is_frozen(pane_id) {
+            self.thaw_pane(pane_id);
+        }
+        self.last_active.insert(pane_id.to_string(), now);
+    }
+
+    /// tab.focused 兜底（payload 无 pane_id）：查该 tab 当前聚焦 pane → on_focus。
+    /// pane.focused 通常已覆盖切 tab 场景，此处防边界未触发。
+    fn on_tab_focus(&mut self, tab_id: &str, workspace_id: &str, now: Instant) {
+        let panes = match api::pane_list(workspace_id) {
+            Ok(p) => p,
+            Err(_) => return,
         };
+        if let Some(focused) = panes.iter().find(|p| p.tab_id == tab_id && p.focused) {
+            self.on_focus(&focused.pane_id, now);
+        }
+    }
+
+    fn freeze_pane(&mut self, p: &api::Pane, info: &api::ProcessInfo) {
         let roots = if !info.foreground_pids.is_empty() {
             info.foreground_pids.clone()
         } else if let Some(shell) = info.shell_pid {
@@ -234,7 +284,7 @@ impl Monitor {
         let orig_label = p.label.clone();
         // 标记 ❄ 前缀（保留原标题以便恢复）
         let new_label = match &orig_label {
-            Some(l) if l.starts_with(MARKER) => None, // 已标记则不动
+            Some(l) if l.starts_with(MARKER) => None,
             Some(l) => Some(format!("{MARKER}{l}")),
             None => Some(format!("{MARKER}{}", p.title.as_deref().unwrap_or(""))),
         };
@@ -262,7 +312,34 @@ impl Monitor {
         state::save_frozen(&self.frozen);
     }
 
-    /// 解冻整 tab：恢复进程、还原标签、关蒙层、设冷却。
+    /// 解冻单个 pane（聚焦触发）：恢复进程 + 还原标签 + 重置计时 + 设该 tab 冷却。
+    fn thaw_pane(&mut self, pane_id: &str) {
+        let entry = match self.frozen.iter().find(|f| f.pane_id == pane_id) {
+            Some(e) => e.clone(),
+            None => return,
+        };
+        freezer::resume(&FreezeTarget {
+            roots: entry.roots.clone(),
+            pgid: entry.pgid,
+        });
+        if let Err(e) = api::pane_set_label(&entry.pane_id, entry.orig_label.as_deref()) {
+            eprintln!("[herdr-freeze] 恢复标签 {} 失败: {e}", entry.pane_id);
+        }
+        // 重置计时，避免立刻再冻结
+        self.last_cpu
+            .insert(entry.pane_id.clone(), (cpu_sample::CpuTime(0), Instant::now()));
+        self.last_active.insert(entry.pane_id.clone(), Instant::now());
+        self.cooldown
+            .insert(entry.tab_id.clone(), Instant::now() + COOLDOWN);
+        self.frozen.retain(|f| f.pane_id != entry.pane_id);
+        state::save_frozen(&self.frozen);
+        eprintln!(
+            "[herdr-freeze] 解冻 pane={} tab={}",
+            entry.pane_id, entry.tab_id
+        );
+    }
+
+    /// 解冻整 tab：恢复进程、还原标签、设冷却（thaw CLI / 信号用）。
     fn thaw_tab(&mut self, tab_id: &str) {
         let entries: Vec<FrozenEntry> = self
             .frozen
@@ -275,39 +352,21 @@ impl Monitor {
                 roots: e.roots.clone(),
                 pgid: e.pgid,
             });
-            // 恢复原始 label（去掉 ❄ 前缀）
             if let Err(err) = api::pane_set_label(&e.pane_id, e.orig_label.as_deref()) {
                 eprintln!("[herdr-freeze] 恢复标签 {} 失败: {err}", e.pane_id);
             }
-            // 重置该 pane 的空闲计时，避免立刻再冻结
-            self.last_change
-                .insert(e.pane_id.clone(), (0, Instant::now()));
+            self.last_cpu
+                .insert(e.pane_id.clone(), (cpu_sample::CpuTime(0), Instant::now()));
+            self.last_active.insert(e.pane_id.clone(), Instant::now());
         }
-        // 关闭该 tab 的蒙层
-        let to_close: Vec<String> = self
-            .overlays
-            .iter()
-            .filter(|o| o.tab_id == tab_id)
-            .map(|o| o.pane_id.clone())
-            .collect();
-        for pane_id in &to_close {
-            let _ = api::plugin_pane_close(pane_id);
-        }
-        self.overlays.retain(|o| o.tab_id != tab_id);
         self.frozen.retain(|f| f.tab_id != tab_id);
         self.cooldown
             .insert(tab_id.to_string(), Instant::now() + COOLDOWN);
         state::save_frozen(&self.frozen);
-        eprintln!(
-            "[herdr-freeze] 解冻 tab={} ({} pane)",
-            tab_id,
-            entries.len()
-        );
+        eprintln!("[herdr-freeze] 解冻 tab={} ({} pane)", tab_id, entries.len());
     }
 
     fn force_freeze_tab(&mut self, tab_id: &str) {
-        // 遍历 workspaces 找到包含该 tab 的 workspace（受 enable 限制）。freeze-now
-        // 不受 idle 阈值限制，但尊重 workspace 是否开启冻结。
         let workspaces = match api::workspace_list() {
             Ok(list) => list,
             Err(e) => {
@@ -335,10 +394,14 @@ impl Monitor {
                 if p.tab_id != tab_id || self.is_frozen(&p.pane_id) {
                     continue;
                 }
-                if self.overlays.iter().any(|o| o.pane_id == p.pane_id) {
-                    continue;
-                }
-                self.freeze_pane(p);
+                let info = match api::pane_process_info(&p.pane_id) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        eprintln!("[herdr-freeze] freeze-now process-info {} 失败: {e}", p.pane_id);
+                        continue;
+                    }
+                };
+                self.freeze_pane(p, &info);
             }
             return;
         }
@@ -346,59 +409,6 @@ impl Monitor {
             "[herdr-freeze] freeze-now: 找不到 tab={} 所属 workspace（或该 workspace 关闭了冻结）",
             tab_id
         );
-    }
-
-    fn manage_overlays(&mut self, ws: &api::Workspace, panes: &[api::Pane]) {
-        use std::collections::HashSet;
-        let overlay_panes: HashSet<&str> =
-            self.overlays.iter().map(|o| o.pane_id.as_str()).collect();
-
-        // 按 tab 分组（排除蒙层 pane）
-        let mut tabs: HashMap<String, Vec<&api::Pane>> = HashMap::new();
-        for p in panes {
-            if overlay_panes.contains(p.pane_id.as_str()) {
-                continue;
-            }
-            tabs.entry(p.tab_id.clone()).or_default().push(p);
-        }
-
-        for (tab_id, tab_panes) in &tabs {
-            let total = tab_panes.len();
-            let frozen_count = tab_panes
-                .iter()
-                .filter(|p| self.is_frozen(&p.pane_id))
-                .count();
-            let all_frozen = total > 0 && frozen_count == total;
-            let has_overlay = self.overlays.iter().any(|o| o.tab_id == *tab_id);
-
-            if all_frozen && !has_overlay {
-                // 仅在该 tab 是当前聚焦 tab 时弹蒙层，避免抢焦点到非聚焦 tab
-                if ws.active_tab_id == *tab_id {
-                    let target = tab_panes[0].pane_id.clone();
-                    match api::plugin_pane_open(
-                        "herdr-freeze",
-                        "frozen",
-                        "overlay",
-                        &ws.workspace_id,
-                        &target,
-                    ) {
-                        Ok(pane_id) => {
-                            eprintln!("[herdr-freeze] 弹蒙层 tab={} overlay={}", tab_id, pane_id);
-                            self.overlays.push(Overlay {
-                                workspace_id: ws.workspace_id.clone(),
-                                tab_id: tab_id.clone(),
-                                pane_id,
-                            });
-                        }
-                        Err(e) => eprintln!("[herdr-freeze] 打开蒙层失败 tab={}: {e}", tab_id),
-                    }
-                }
-            } else if !all_frozen && has_overlay {
-                // tab 不再全冻结（出现新 pane / 某 pane 已不在冻结集）→ 解冻
-                eprintln!("[herdr-freeze] tab={} 不再全冻结，收起蒙层并解冻", tab_id);
-                self.thaw_tab(tab_id);
-            }
-        }
     }
 
     fn reap_closed_panes(&mut self, panes: &[api::Pane]) {
@@ -410,12 +420,13 @@ impl Monitor {
             .cloned()
             .collect();
         for e in &dead {
-            // best-effort 解挂（进程可能已退出）
             freezer::resume(&FreezeTarget {
                 roots: e.roots.clone(),
                 pgid: e.pgid,
             });
-            self.last_change.remove(&e.pane_id);
+            self.last_cpu.remove(&e.pane_id);
+            self.last_active.remove(&e.pane_id);
+            self.last_rev.remove(&e.pane_id);
         }
         if !dead.is_empty() {
             self.frozen.retain(|f| live.contains(f.pane_id.as_str()));

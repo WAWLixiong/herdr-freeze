@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-crossterm = "0.29"
+interprocess = "2.4.2"
 
 # No windows-sys / libc dependency: platform FFI (NtSuspendProcess / kill) is
 # declared inline in src/freezer.rs, mirroring the work-assistant freezer.
