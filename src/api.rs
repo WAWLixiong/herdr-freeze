@@ -155,9 +155,9 @@ pub struct Pane {
     pub pane_id: String,
     pub workspace_id: String,
     pub tab_id: String,
-    #[allow(dead_code)]
     pub focused: bool,
     pub label: Option<String>,
+    #[allow(dead_code)]
     pub title: Option<String>,
     pub revision: u64,
 }

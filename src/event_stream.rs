@@ -30,6 +30,8 @@ use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+use crate::{freeze_dbg, freeze_log};
+
 /// 聚焦事件。pane.focused 直接给 pane_id；tab.focused 给 tab_id+workspace_id
 /// （payload 无 pane_id，守护进程查该 tab 当前聚焦 pane）。
 #[derive(Debug, Clone)]
@@ -58,21 +60,17 @@ pub fn spawn_reader(tx: Sender<FocusEvent>) -> std::thread::JoinHandle<()> {
                     first_fail = None;
                 }
                 Err(StreamError::SocketGone) => {
-                    eprintln!(
-                        "[herdr-freeze] herdr socket 文件消失，认定 herdr 已退出，退出守护进程"
-                    );
+                    freeze_log!("herdr socket 文件消失，认定 herdr 已退出，退出守护进程");
                     std::process::exit(0);
                 }
                 Err(StreamError::Transient(e)) => {
                     let now = Instant::now();
                     let first = *first_fail.get_or_insert(now);
                     if now.duration_since(first) >= Duration::from_secs(60) {
-                        eprintln!(
-                            "[herdr-freeze] event stream 连续重连失败超 60s，兜底退出守护进程: {e}"
-                        );
+                        freeze_log!("event stream 连续重连失败超 60s，兜底退出守护进程: {e}");
                         std::process::exit(0);
                     }
-                    eprintln!("[herdr-freeze] event stream: {e}，2s 后重连");
+                    freeze_log!("event stream: {e}，2s 后重连");
                     std::thread::sleep(Duration::from_secs(2));
                 }
             }
@@ -112,13 +110,17 @@ fn run_stream(tx: &Sender<FocusEvent>) -> Result<(), StreamError> {
     reader
         .read_line(&mut ack)
         .map_err(|e| classify_read_err(&path, e))?;
+    freeze_dbg!("event stream ack: {}", ack.trim());
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(ack.trim()) {
         if v.get("error").is_some() {
+            freeze_log!("subscribe 被拒: {v}");
             return Err(StreamError::Transient(format!("subscribe 被拒: {v}")));
         }
+    } else {
+        freeze_dbg!("event stream ack 非 JSON: {:?}", ack);
     }
 
-    eprintln!("[herdr-freeze] event stream 已连接，订阅 pane.focused+tab.focused");
+    freeze_log!("event stream 已连接，订阅 pane.focused+tab.focused");
 
     // 循环读 bare EventEnvelope（一行一个 JSON）。EOF = herdr 关 socket
     // （退出/重启），交由上层 classify 决定自杀或重连。
@@ -128,6 +130,7 @@ fn run_stream(tx: &Sender<FocusEvent>) -> Result<(), StreamError> {
             .read_line(&mut buf)
             .map_err(|e| classify_read_err(&path, e))?;
         if n == 0 {
+            freeze_dbg!("event stream EOF (herdr 关流)");
             return Err(classify_eof(&path));
         }
         if let Some(ev) = parse_event(&buf) {
@@ -194,16 +197,23 @@ fn parse_event(line: &str) -> Option<FocusEvent> {
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     let event = v.get("event")?.as_str()?;
     let data = v.get("data")?;
+    // herdr 的 EventKind 用 serde rename_all="snake_case" 序列化，故 wire 是
+    // "pane_focused"/"tab_focused"（下划线），而非 dot_name() 的点分形式。
     match event {
-        "pane.focused" => {
+        "pane_focused" => {
             let pane_id = data.get("pane_id")?.as_str()?;
+            freeze_dbg!("event pane_focused pane={}", pane_id);
             Some(FocusEvent::Pane(pane_id.to_string()))
         }
-        "tab.focused" => {
+        "tab_focused" => {
             let tab_id = data.get("tab_id")?.as_str()?;
             let workspace_id = data.get("workspace_id")?.as_str()?;
+            freeze_dbg!("event tab_focused tab={} ws={}", tab_id, workspace_id);
             Some(FocusEvent::Tab(tab_id.to_string(), workspace_id.to_string()))
         }
-        _ => None,
+        _ => {
+            freeze_dbg!("event 未知 event={}", event);
+            None
+        }
     }
 }

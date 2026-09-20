@@ -20,6 +20,65 @@ mod monitor;
 mod state;
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// DEBUG 日志总开关。两条开启路径任一即开：
+/// - CLI flag `herdr-freeze monitor --debug`/`-v`（main 解析后 enable_debug()）
+/// - env var `HERDR_FREEZE_DEBUG`（任意非空值；插件场景 startup hook 继承
+///   herdr 进程环境，用户 `HERDR_FREEZE_DEBUG=1 herdr` 即可，无需改清单）
+static DEBUG: AtomicBool = AtomicBool::new(false);
+
+/// CLI flag 开启 DEBUG（monitor 子命令解析 --debug 时调用）。
+pub(crate) fn enable_debug() {
+    DEBUG.store(true, Ordering::Relaxed);
+}
+
+/// DEBUG 是否开启。flag 或 env 任一为真即开。
+pub(crate) fn debug_enabled() -> bool {
+    DEBUG.load(Ordering::Relaxed) || std::env::var("HERDR_FREEZE_DEBUG").is_ok()
+}
+
+/// 日志文件路径（固定，便于 startup hook 场景查看——herdr 捕获 stderr 到
+/// 内存不暴露内容，改写文件后 `HERDR_FREEZE_DEBUG=1 herdr` 重启会话即可
+/// `tail -f /tmp/herdr-freeze.log` 看 monitor 判定链路 + event stream）。
+pub(crate) const LOG_FILE: &str = "/tmp/herdr-freeze.log";
+
+/// 追加写一行到日志文件（best-effort，失败静默）。带秒级时间戳，便于测延迟。
+pub(crate) fn file_log(line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(LOG_FILE)
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let _ = writeln!(f, "{ts:.3} {line}");
+    }
+}
+
+/// INFO 级日志（始终 stderr + 文件）。统一前缀 `[herdr-freeze]`。
+macro_rules! freeze_log {
+    ($($t:tt)*) => {{
+        let line = format!("[herdr-freeze] {}", format_args!($($t)*));
+        eprintln!("{}", line);
+        crate::file_log(&line);
+    }};
+}
+/// DEBUG 级日志（debug_enabled() 时 stderr + 文件）。前缀 `[herdr-freeze] [dbg]`。
+macro_rules! freeze_dbg {
+    ($($t:tt)*) => {{
+        if crate::debug_enabled() {
+            let line = format!("[herdr-freeze] [dbg] {}", format_args!($($t)*));
+            eprintln!("{}", line);
+            crate::file_log(&line);
+        }
+    }};
+}
+pub(crate) use freeze_dbg;
+pub(crate) use freeze_log;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -33,6 +92,13 @@ fn main() {
                 print_monitor_help();
                 0
             } else {
+                // --debug / -v / --verbose：开启 DEBUG 判定链路日志
+                if args[1..]
+                    .iter()
+                    .any(|a| a == "--debug" || a == "-v" || a == "--verbose")
+                {
+                    enable_debug();
+                }
                 monitor::Monitor::run()
             }
         }
@@ -101,13 +167,18 @@ fn print_help() {
 fn print_monitor_help() {
     println!("herdr-freeze monitor - 常驻监控守护进程\n");
     println!("USAGE:");
-    println!("    herdr-freeze monitor\n");
+    println!("    herdr-freeze monitor [--debug]\n");
     println!("由 herdr startup hook 在会话恢复时拉起。常驻：周期（15s）采样每 pane");
     println!("进程组 CPU 时间判空闲，挂起空闲进程树；订阅 pane.focused/tab.focused");
     println!("事件流，聚焦冻结 pane 即时解冻。herdr 退出时（socket 文件消失）");
     println!("自动退出，不留孤儿。\n");
     println!("手动运行（调试）：Ctrl-C 退出。首个 tick 初始化 CPU 采样基线，");
-    println!("idle_secs 内不会冻结。");
+    println!("idle_secs 内不会冻结。\n");
+    println!("OPTIONS:");
+    println!("    --debug, -v, --verbose   打印判定链路 DEBUG 日志（每 pane 每 tick");
+    println!("             的走向、CPU 采样值、label 处理）。等价于设");
+    println!("             HERDR_FREEZE_DEBUG=1。插件场景用 env var 更省事：");
+    println!("             `HERDR_FREEZE_DEBUG=1 herdr`（startup hook 继承）。");
 }
 
 fn print_config_help() {

@@ -13,16 +13,20 @@
 //! - Linux：遍历 /proc/[pid]/stat，按 pgrp 匹配进程组，求和 utime+stime
 //!   （jiffies，CLK_TCK 假定 100，即 1 jiffy=10ms）。无 pgid 时用 roots
 //!   单 pid 兜底。无新依赖（std::fs 读 /proc）。
-//! - macOS：对 roots（herdr 给的 foreground_processes，agent 实体）逐 pid
-//!   proc_pidinfo(PROC_PIDTASKINFO) 取 total_user+total_system（ns）。
-//!   不遍历整个进程组（需 PROC_PIDTBSDINFO 查 pbi_pgid，struct layout 复杂
-//!   且易错；foreground_pids 已是活动主体，MVP 以此为准）。
+//! - macOS：pgid 给出时用 `proc_listpids(PROC_PGRP_ONLY, pgid)` 列出该
+//!   进程组全部 pid，逐 pid `proc_pidinfo(PROC_PIDTASKINFO)` 取
+//!   total_user+total_system（ns）求和（与 Linux `/proc` by pgrp 等价，
+//!   覆盖 shell 子进程 vim/opencode/cargo build 等同组进程）；
+//!   pgid=None 时用 roots 逐 pid 兜底。不走 `PROC_PIDTBSDINFO`——
+//!   内核直接按 pgid 过滤，无需逐 pid 取 pbi_pgid（避开 struct layout 风险）。
 //!
 //! busy_ratio：t0→sleep window→t1，delta 归一化为「一核的占比」
 //! （0.0=0 核，1.0=满载一核），阈值 >0.10 即 10% 一核，与 work-assistant
 //! 的 FREEZE_CPU_BUSY_RATIO 一致、跨平台可比。
 
 use std::time::Duration;
+
+use crate::freeze_dbg;
 
 /// 平台内一致的 CPU 时间累加值（单位随平台：Windows=100ns ticks，
 /// Linux=jiffies，macOS=ns）。仅需同平台内 delta>0 判活动 + busy_ratio 归一化。
@@ -31,20 +35,27 @@ pub struct CpuTime(pub u64);
 
 /// 采样进程组/树的总 CPU 时间。
 /// Windows：roots 作为树根 BFS（pgid 忽略）；Linux：pgid 匹配进程组
-/// （无 pgid 用 roots 单 pid）；macOS：roots 各 pid 的 taskinfo 求和。
+/// （无 pgid 用 roots 单 pid）；macOS：pgid 给出时按进程组遍历
+/// （proc_listpids PROC_PGRP_ONLY，与 Linux 等价），否则 roots 逐 pid。
 pub fn sample(roots: &[u32], pgid: Option<u32>) -> CpuTime {
-    let _ = pgid; // Windows/macOS 分支不用 pgid（仅 Linux 用），此处统一消警告
+    let _ = pgid; // Windows 分支不用 pgid（Linux/macOS 用），此处统一消警告
     #[cfg(windows)]
     {
-        CpuTime(sample_windows(roots))
+        let total = sample_windows(roots);
+        freeze_dbg!("sample(Windows) roots={:?} → {}", roots, total);
+        CpuTime(total)
     }
     #[cfg(target_os = "linux")]
     {
-        CpuTime(sample_linux(pgid, roots))
+        let total = sample_linux(pgid, roots);
+        freeze_dbg!("sample(Linux) pgid={:?} roots={:?} → {}", pgid, roots, total);
+        CpuTime(total)
     }
     #[cfg(target_os = "macos")]
     {
-        CpuTime(sample_macos(roots))
+        let total = sample_macos(roots, pgid);
+        freeze_dbg!("sample(macOS) roots={:?} pgid={:?} → {}", roots, pgid, total);
+        CpuTime(total)
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
@@ -61,6 +72,14 @@ pub fn busy_ratio(roots: &[u32], pgid: Option<u32>, window_ms: u64) -> f64 {
     let t1 = sample(roots, pgid).0;
     let delta = t1.saturating_sub(t0);
     cores_fraction(delta, window_ms)
+}
+
+/// 两次采样的 delta 折算成一核占比（0.0=0 核，1.0=满载一核），用于 active 判定。
+/// duration 是两次采样的时间间隔。比 `cur != prev`（任何 delta>0 都算活跃）更
+/// 合理：低 CPU 后台活动（如 agent LSP/心跳 0.65%）低于阈值判空闲可冻，
+/// 真工作（如 cargo build 50%）高于阈值判活跃不冻。
+pub(crate) fn delta_cores(delta: u64, duration: Duration) -> f64 {
+    cores_fraction(delta, duration.as_millis() as u64)
 }
 
 #[cfg(windows)]
@@ -210,48 +229,87 @@ fn read_proc_stat(pid: u32) -> Option<(u64, u64)> {
 
 // =============================== macOS ===============================
 
-/// macOS：对 roots（foreground_pids）各 pid proc_pidinfo(PROC_PIDTASKINFO)
-/// 取 total_user+total_system（ns）求和。不遍历整个进程组（struct layout
-/// 风险，foreground_pids 已是活动主体）。
+/// macOS：进程树遍历采样（`proc_listpids(PROC_PPID_ONLY)` 递归 BFS）。
+///
+/// 覆盖 roots 的所有子孙，**含跨进程组派生的子孙**（如 nvim `--embed`
+/// 子进程自己 setpgd，进程组 pgid 遍历采不到它的 CPU，会导致主进程空闲
+/// 但 --embed 在跑时误判空闲冻结）。比 pgid 进程组覆盖更全，且与
+/// freeze/resume 的 tree_pids 同源，采样与冻结范围一致。
+/// 逐 pid `PROC_PIDTASKINFO` 取 total_user+total_system（ns）求和。
 #[cfg(target_os = "macos")]
-fn sample_macos(roots: &[u32]) -> u64 {
-    // proc_taskinfo 仅取前 4 个 u64（virtual/resident/total_user/total_system，
-    // offset 0/8/16/24），buffersize=32 足以拿到 total_user/system。
-    #[repr(C)]
-    #[derive(Default, Clone, Copy)]
-    struct ProcTaskInfo {
-        pti_virtual_size: u64,
-        pti_resident_size: u64,
-        pti_total_user: u64,
-        pti_total_system: u64,
-    }
-    // PROC_PIDTASKINFO = 4
-    const PROC_PIDTASKINFO: u32 = 4;
-    extern "C" {
-        fn proc_pidinfo(
-            pid: i32,
-            flavor: u32,
-            arg: u64,
-            buffer: *mut u8,
-            buffersize: i32,
-        ) -> i32;
-    }
+fn sample_macos(roots: &[u32], _pgid: Option<u32>) -> u64 {
+    let pids = crate::freezer::tree_pids(roots);
     let mut total = 0u64;
-    for &pid in roots {
-        let mut info = ProcTaskInfo::default();
-        let n = unsafe {
-            proc_pidinfo(
-                pid as i32,
-                PROC_PIDTASKINFO,
-                0,
-                &mut info as *mut _ as *mut u8,
-                std::mem::size_of::<ProcTaskInfo>() as i32,
-            )
-        };
-        if n >= std::mem::size_of::<ProcTaskInfo>() as i32 {
-            total = total.saturating_add(info.pti_total_user);
-            total = total.saturating_add(info.pti_total_system);
-        }
+    for &pid in &pids {
+        total = total.saturating_add(pid_cpu_time(pid));
     }
+    freeze_dbg!(
+        "sample_macOS roots={:?} tree_pids={} total={}",
+        roots,
+        pids.len(),
+        total
+    );
     total
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct ProcTaskInfo {
+    pti_virtual_size: u64,
+    pti_resident_size: u64,
+    pti_total_user: u64,
+    pti_total_system: u64,
+    pti_threads_user: u64,
+    pti_threads_system: u64,
+    pti_policy: i32,
+    pti_faults: i32,
+    pti_pageins: i32,
+    pti_cow_faults: i32,
+    pti_messages_sent: i32,
+    pti_messages_received: i32,
+    pti_syscalls_mach: i32,
+    pti_syscalls_unix: i32,
+    pti_csw: i32,
+    pti_threadnum: i32,
+    pti_numrunning: i32,
+    pti_priority: i32,
+}
+
+/// PROC_PIDTASKINFO = 4（proc_info.h）。
+#[cfg(target_os = "macos")]
+const PROC_PIDTASKINFO: u32 = 4;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn proc_pidinfo(
+        pid: i32,
+        flavor: u32,
+        arg: u64,
+        buffer: *mut u8,
+        buffersize: i32,
+    ) -> i32;
+}
+
+/// 单 pid 的 CPU 时间（pti_total_user + pti_total_system，ns）。
+/// proc_pidinfo 失败/缓冲不足返回 0。
+#[cfg(target_os = "macos")]
+fn pid_cpu_time(pid: u32) -> u64 {
+    let mut info = ProcTaskInfo::default();
+    let need = std::mem::size_of::<ProcTaskInfo>() as i32;
+    let n = unsafe {
+        proc_pidinfo(
+            pid as i32,
+            PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut u8,
+            need,
+        )
+    };
+    if n >= need {
+        info.pti_total_user.saturating_add(info.pti_total_system)
+    } else {
+        freeze_dbg!("pid_cpu_time pid={} 失败 n={} need={}", pid, n, need);
+        0
+    }
 }

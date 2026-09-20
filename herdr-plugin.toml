@@ -17,7 +17,7 @@ id = "herdr-freeze"
 name = "Herdr Freeze"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
-description = "Auto-freeze idle pane process trees to release memory, with a click-to-thaw tab overlay."
+description = "Auto-freeze idle pane process trees (CPU-sampled) to release memory; focus a frozen pane to thaw it instantly."
 platforms = ["windows", "linux", "macos"]
 
 # ───────────────────────── 启动钩子：常驻监控守护进程 ─────────────────────────
@@ -59,7 +59,6 @@ command = ["herdr-freeze", "thaw"]
 # 注：不再使用 overlay 蒙层。冻结只挂起进程树 + 给 pane label 加 ❄ 前缀；
 # 解冻靠聚焦事件——守护进程常驻订阅 herdr 的 pane.focused / tab.focused
 # 事件流（events.subscribe），用户聚焦到冻结 pane 即即时恢复该单 pane。
-[[panes]]
 [[panes]]
 id = "config"
 title = "Freeze settings"

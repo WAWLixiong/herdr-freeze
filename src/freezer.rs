@@ -206,15 +206,19 @@ fn resume_tree_windows(roots: &[u32]) -> bool {
     windows_impl::resume_tree(roots)
 }
 
-/// 进程树 pid 列表（Windows BFS；Unix 返回 roots 本身——Unix 冻结用进程组
-/// SIGSTOP，CPU 采样在 Unix 也用进程组遍历而非树）。供 cpu_sample 复用，
-/// 避免 cpu_sample 重复实现 Windows 的进程树 BFS。
+/// 进程树 pid 列表（Windows BFS；macOS 用 proc_listpids(PROC_PPID_ONLY) 递归
+/// BFS 覆盖跨进程组派生的子孙如 nvim --embed 子进程；其他 Unix 返回 roots
+/// 本身，靠进程组 SIGSTOP 覆盖同组进程）。供 freezer + cpu_sample 复用。
 pub(crate) fn tree_pids(roots: &[u32]) -> Vec<u32> {
     #[cfg(windows)]
     {
         windows_impl::tree_pids(roots)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        unix_impl::tree_pids_macos(roots)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         roots.to_vec()
     }
@@ -270,32 +274,96 @@ mod unix_impl {
     pub fn resume_pid(pid: u32) -> bool {
         unsafe { kill(pid as CInt, SIGCONT) == 0 }
     }
+
+    // ------------------------- macOS 进程树遍历 -------------------------
+
+    #[cfg(target_os = "macos")]
+    extern "C" {
+        fn proc_listpids(type_: u32, typeinfo: u32, buffer: *mut u8, buffersize: i32) -> i32;
+    }
+
+    /// proc_listpids 的 type：PROC_PPID_ONLY=6（typeinfo 传 ppid，列出其直接子进程）。
+    #[cfg(target_os = "macos")]
+    const PROC_PPID_ONLY: u32 = 6;
+
+    /// macOS：列出 ppid 的直接子进程 pid（proc_listpids PROC_PPID_ONLY）。
+    #[cfg(target_os = "macos")]
+    fn child_pids(ppid: u32) -> Vec<u32> {
+        let needed = unsafe { proc_listpids(PROC_PPID_ONLY, ppid, std::ptr::null_mut(), 0) };
+        if needed <= 0 {
+            return Vec::new();
+        }
+        let cap = (needed as usize) + 64;
+        let mut buf = vec![0u8; cap];
+        let n = unsafe { proc_listpids(PROC_PPID_ONLY, ppid, buf.as_mut_ptr(), buf.len() as i32) };
+        if n <= 0 {
+            return Vec::new();
+        }
+        let bytes = (n as usize).min(buf.len());
+        let count = bytes / 4;
+        (0..count)
+            .map(|i| {
+                let off = i * 4;
+                u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+            })
+            .collect()
+    }
+
+    /// macOS 进程树 BFS：从 roots 收集所有子孙 pid（含跨进程组派生的子孙，
+    /// 如 nvim --embed 子进程自己 setpgd，进程组 SIGSTOP 停不到）。覆盖 freeze/
+    /// resume/采样，避免主进程停了、--embed 子进程还在跑导致状态不同步退出。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn tree_pids_macos(roots: &[u32]) -> Vec<u32> {
+        use std::collections::{HashSet, VecDeque};
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        let mut queue: VecDeque<u32> = VecDeque::new();
+        for &r in roots {
+            if seen.insert(r) {
+                result.push(r);
+                queue.push_back(r);
+            }
+        }
+        while let Some(pid) = queue.pop_front() {
+            for child in child_pids(pid) {
+                if seen.insert(child) {
+                    result.push(child);
+                    queue.push_back(child);
+                }
+            }
+        }
+        result
+    }
 }
 
 #[cfg(not(windows))]
 fn freeze_unix(target: &FreezeTarget) -> Vec<u32> {
-    if let Some(pgid) = target.pgid {
-        if unix_impl::freeze_group(pgid) {
-            return vec![pgid];
-        }
-    }
+    // 进程树遍历（macOS = 完整树含跨进程组子孙；其他 Unix = roots 本身）。
+    // 覆盖 nvim --embed 等子进程自己 setpgd 的情况（进程组 SIGSTOP 停不到，
+    // 导致主进程停了子进程还在跑、状态不同步退出）。
+    let pids = tree_pids(&target.roots);
     let mut out = Vec::new();
-    for &pid in &target.roots {
+    for &pid in &pids {
         if unix_impl::freeze_pid(pid) {
             out.push(pid);
         }
+    }
+    // 进程组兜底（同组非子孙兄弟，少见但幂等无害）
+    if let Some(pgid) = target.pgid {
+        let _ = unix_impl::freeze_group(pgid);
     }
     out
 }
 
 #[cfg(not(windows))]
 fn resume_unix(target: &FreezeTarget) -> bool {
+    let pids = tree_pids(&target.roots);
     let mut any = false;
+    for &pid in &pids {
+        any |= unix_impl::resume_pid(pid);
+    }
     if let Some(pgid) = target.pgid {
         any |= unix_impl::resume_group(pgid);
-    }
-    for &pid in &target.roots {
-        any |= unix_impl::resume_pid(pid);
     }
     any
 }
