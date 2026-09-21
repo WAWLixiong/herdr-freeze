@@ -231,7 +231,7 @@ mod unix_impl {
     // 不引 libc crate：直接声明 kill 与信号常量。
     type CInt = i32;
 
-    extern "C" {
+    unsafe extern "C" {
         fn kill(pid: CInt, sig: CInt) -> CInt;
     }
 
@@ -278,7 +278,7 @@ mod unix_impl {
     // ------------------------- macOS 进程树遍历 -------------------------
 
     #[cfg(target_os = "macos")]
-    extern "C" {
+    unsafe extern "C" {
         fn proc_listpids(type_: u32, typeinfo: u32, buffer: *mut u8, buffersize: i32) -> i32;
     }
 

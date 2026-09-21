@@ -281,7 +281,7 @@ struct ProcTaskInfo {
 const PROC_PIDTASKINFO: u32 = 4;
 
 #[cfg(target_os = "macos")]
-extern "C" {
+unsafe extern "C" {
     fn proc_pidinfo(
         pid: i32,
         flavor: u32,
