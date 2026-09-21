@@ -155,7 +155,7 @@ fn ft_to_u64(ft: &FileTime) -> u64 {
 fn sample_windows(roots: &[u32]) -> u64 {
     use crate::freezer;
     let mut total = 0u64;
-    for &pid in freezer::tree_pids(roots) {
+    for pid in freezer::tree_pids(roots) {
         let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if h == 0 || h == INVALID_HANDLE {
             continue;

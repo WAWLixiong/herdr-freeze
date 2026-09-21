@@ -159,6 +159,11 @@ pub struct Pane {
     pub label: Option<String>,
     #[allow(dead_code)]
     pub title: Option<String>,
+    /// agent 状态：idle/working/blocked/done/unknown（pane list 的 agent_status
+    /// 字段）。None 或 Some("unknown") = 非 agent pane。用于 agent pane 空闲
+    /// 判定——agent_status=idle/done 视为空闲可冻（即使后台 CPU 活动），
+    /// 比 CPU 采样更准（接近 work-assistant 的 PTY 输出判定）。
+    pub agent_status: Option<String>,
     pub revision: u64,
 }
 
@@ -194,6 +199,11 @@ pub fn pane_list(workspace_id: &str) -> Result<Vec<Pane>, String> {
             title: p
                 .get("title")
                 .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            agent_status: p
+                .get("agent_status")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty() && *s != "unknown")
                 .map(|s| s.to_string()),
             revision: p.get("revision").and_then(|v| v.as_u64()).unwrap_or(0),
         });

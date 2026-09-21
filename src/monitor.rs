@@ -299,25 +299,42 @@ impl Monitor {
                 };
                 let cur = cpu_sample::sample(&roots, info.foreground_process_group_id);
                 let prev = self.last_cpu.get(&p.pane_id).copied();
-                // active 判定用归一化阈值：delta 折算成一核占比 > ACTIVE_CPU_THRESHOLD
-                // 才算活跃。比 `cur != prev`（任何 delta>0 都算活跃）更合理——agent 后台
-                // 活动（LSP/心跳 0.5-1%）低于阈值判空闲可冻，真工作（>10%）判活跃不冻。
-                let active = match prev {
-                    None => true, // 首次采样建基线
-                    Some((prev_cpu, prev_t)) => {
-                        let delta = cur.0.saturating_sub(prev_cpu.0);
-                        let elapsed = now.duration_since(prev_t);
-                        cpu_sample::delta_cores(delta, elapsed) > ACTIVE_CPU_THRESHOLD
+                // active 判定分两路：
+                // - agent pane（agent_status 有值，api.rs 已过滤 unknown）：用 agent_status
+                //   判定——idle/done = 空闲（即使后台 CPU 活动也判 inactive 可冻），
+                //   working/blocked = 活跃不冻。比 CPU 采样更准（agent 自报状态，
+                //   接近 work-assistant 的 PTY 输出判定），解决 opencode 后台 LSP/心跳
+                //   CPU 活动导致永远 active 不冻的问题。
+                // - 非 agent pane：CPU 采样 delta 归一化 > ACTIVE_CPU_THRESHOLD 算活跃。
+                let agent_status = p.agent_status.as_deref();
+                let is_agent = agent_status.is_some();
+                let agent_idle = matches!(agent_status, Some("idle") | Some("done"));
+                let active = if is_agent {
+                    !agent_idle
+                } else {
+                    match prev {
+                        None => true, // 首次采样建基线
+                        Some((prev_cpu, prev_t)) => {
+                            let delta = cur.0.saturating_sub(prev_cpu.0);
+                            let elapsed = now.duration_since(prev_t);
+                            cpu_sample::delta_cores(delta, elapsed) > ACTIVE_CPU_THRESHOLD
+                        }
                     }
                 };
                 if active {
                     freeze_dbg!(
-                        "pane={} cpu active prev={:?} cur={} → skip(active)",
+                        "pane={} {} active prev={:?} cur={} → skip(active)",
                         p.pane_id,
+                        if is_agent {
+                            format!("agent={}", agent_status.unwrap_or(""))
+                        } else {
+                            "cpu".to_string()
+                        },
                         prev.map(|(c, _)| c.0),
                         cur.0
                     );
                     self.last_cpu.insert(p.pane_id.clone(), (cur, now));
+                    self.last_active.insert(p.pane_id.clone(), now);
                     continue;
                 }
                 // CPU 不变 → 检查空闲时长 + 聚焦 grace

@@ -90,7 +90,8 @@ fn run_stream(tx: &Sender<FocusEvent>) -> Result<(), StreamError> {
         "params": {
             "subscriptions": [
                 {"type": "pane.focused"},
-                {"type": "tab.focused"}
+                {"type": "tab.focused"},
+                {"type": "pane.agent_status_changed"}
             ]
         }
     });
@@ -210,6 +211,21 @@ fn parse_event(line: &str) -> Option<FocusEvent> {
             let workspace_id = data.get("workspace_id")?.as_str()?;
             freeze_dbg!("event tab_focused tab={} ws={}", tab_id, workspace_id);
             Some(FocusEvent::Tab(tab_id.to_string(), workspace_id.to_string()))
+        }
+        "pane_agent_status_changed" => {
+            let pane_id = data.get("pane_id")?.as_str()?;
+            let agent_status = data
+                .get("agent_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            freeze_dbg!(
+                "event pane_agent_status_changed pane={} status={}",
+                pane_id,
+                agent_status
+            );
+            // agent 状态变化（idle↔working↔blocked）视为活动，刷 last_active
+            // （60s grace）——状态变化即活动，避免冻到刚切换状态的 agent。
+            Some(FocusEvent::Pane(pane_id.to_string()))
         }
         _ => {
             freeze_dbg!("event 未知 event={}", event);
