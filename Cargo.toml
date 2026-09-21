@@ -2,7 +2,7 @@
 name = "herdr-freeze"
 version = "0.1.0"
 description = "Herdr plugin: auto-freeze idle pane process trees to release memory, with a click-to-thaw tab overlay."
-edition = "2021"
+edition = "2024"
 
 [[bin]]
 name = "herdr-freeze"
