@@ -79,7 +79,7 @@ mod windows_impl {
     const INVALID_HANDLE: isize = -1;
 
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> isize;
         fn CloseHandle(handle: isize) -> i32;
         fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> isize;
@@ -89,7 +89,7 @@ mod windows_impl {
     }
 
     #[link(name = "ntdll")]
-    extern "system" {
+    unsafe extern "system" {
         fn NtSuspendProcess(handle: isize) -> i32;
         fn NtResumeProcess(handle: isize) -> i32;
     }

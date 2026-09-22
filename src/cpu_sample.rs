@@ -128,7 +128,7 @@ struct FileTime {
 
 #[cfg(windows)]
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> isize;
     fn CloseHandle(handle: isize) -> i32;
     fn GetProcessTimes(
