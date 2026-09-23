@@ -40,8 +40,19 @@ pub(crate) fn debug_enabled() -> bool {
 
 /// 日志文件路径（固定，便于 startup hook 场景查看——herdr 捕获 stderr 到
 /// 内存不暴露内容，改写文件后 `HERDR_FREEZE_DEBUG=1 herdr` 重启会话即可
-/// `tail -f /tmp/herdr-freeze.log` 看 monitor 判定链路 + event stream）。
-pub(crate) const LOG_FILE: &str = "/tmp/herdr-freeze.log";
+/// `tail -f` 看 monitor 判定链路 + event stream）。
+/// Unix 固定 /tmp/herdr-freeze.log；Windows 上 "/tmp" 会被解析为「当前盘符
+/// 根\tmp」，该目录通常不存在 → OpenOptions create 静默失败、日志全丢，
+/// 故改用 %TEMP%\herdr-freeze.log。
+pub(crate) fn log_file() -> std::path::PathBuf {
+    if cfg!(windows) {
+        std::env::var("TEMP")
+            .map(|d| std::path::PathBuf::from(d).join("herdr-freeze.log"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("herdr-freeze.log"))
+    } else {
+        std::path::PathBuf::from("/tmp/herdr-freeze.log")
+    }
+}
 
 /// 追加写一行到日志文件（best-effort，失败静默）。带秒级时间戳，便于测延迟。
 pub(crate) fn file_log(line: &str) {
@@ -49,7 +60,7 @@ pub(crate) fn file_log(line: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(LOG_FILE)
+        .open(log_file())
     {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

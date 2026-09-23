@@ -13,6 +13,10 @@
 //!   返回 unsupported_event_wait_match），故必须用 events.subscribe 流式。
 //! - `Subscription::PaneFocused{}`/`TabFocused{}` 无过滤字段，订阅全量事件，
 //!   守护进程在内存按 workspace 过滤。
+//! - 订阅 `pane.agent_status_changed` 自 herdr 0.9.1 起必填 `pane_id`（无字段
+//!   全量订阅整个请求被拒：invalid_request: missing field `pane_id`，曾导致
+//!   monitor 每 2s 重试、60s 后兜底自杀），无法全量订阅故不订阅——agent 状态
+//!   判定本就走 tick 轮询 pane list 的 agent_status 字段（15s 粒度足够）。
 //!
 //! reader 线程阻塞 read_line 收事件，经 mpsc channel 发给主线程。
 //!
@@ -90,8 +94,7 @@ fn run_stream(tx: &Sender<FocusEvent>) -> Result<(), StreamError> {
         "params": {
             "subscriptions": [
                 {"type": "pane.focused"},
-                {"type": "tab.focused"},
-                {"type": "pane.agent_status_changed"}
+                {"type": "tab.focused"}
             ]
         }
     });
@@ -212,6 +215,8 @@ fn parse_event(line: &str) -> Option<FocusEvent> {
             freeze_dbg!("event tab_focused tab={} ws={}", tab_id, workspace_id);
             Some(FocusEvent::Tab(tab_id.to_string(), workspace_id.to_string()))
         }
+        // 未订阅（0.9.1 起需逐 pane pane_id，见模块注释），保留解析做前向
+        // 兼容：若未来恢复全量推送或改为动态逐 pane 订阅，此处即刻生效。
         "pane_agent_status_changed" => {
             let pane_id = data.get("pane_id")?.as_str()?;
             let agent_status = data

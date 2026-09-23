@@ -338,32 +338,51 @@ mod unix_impl {
 
 #[cfg(not(windows))]
 fn freeze_unix(target: &FreezeTarget) -> Vec<u32> {
-    // 进程树遍历（macOS = 完整树含跨进程组子孙；其他 Unix = roots 本身）。
-    // 覆盖 nvim --embed 等子进程自己 setpgd 的情况（进程组 SIGSTOP 停不到，
-    // 导致主进程停了子进程还在跑、状态不同步退出）。
-    let pids = tree_pids(&target.roots);
-    let mut out = Vec::new();
-    for &pid in &pids {
-        if unix_impl::freeze_pid(pid) {
-            out.push(pid);
-        }
-    }
-    // 进程组兜底（同组非子孙兄弟，少见但幂等无害）
+    // 先原子停整组（一次 kill 系统调用，零窗口期），再多轮重扫逐个补停
+    // 跨进程组派生的子孙（自己 setpgid 的，组 SIGSTOP 停不到）。
+    //
+    // 顺序很重要：原实现先逐 pid BFS 停（parent 先停，同组 children 在逐个
+    // kill 的窗口期里继续跑、还可能派生新子孙），最后才停组——部分冻结会让
+    // TUI + embed/server 子进程状态不同步而退出（nvim --embed 教训，疑似
+    // macOS 上 opencode 冻后退出的根因之一）。组停先行把主群原子冻结，
+    // 窗口期只剩跨组子孙，由重扫兜底。
     if let Some(pgid) = target.pgid {
         let _ = unix_impl::freeze_group(pgid);
+    }
+    // 多轮重扫（对齐 Windows freeze_tree 的竞态修复）：每轮停完重新遍历树，
+    // 把冻结窗口期间新派生的子孙一并停掉，直到一轮没有新增。
+    let mut out: Vec<u32> = Vec::new();
+    let mut stopped: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for _ in 0..5 {
+        let mut new_any = false;
+        for pid in tree_pids(&target.roots) {
+            if stopped.contains(&pid) {
+                continue;
+            }
+            if unix_impl::freeze_pid(pid) {
+                stopped.insert(pid);
+                out.push(pid);
+                new_any = true;
+            }
+        }
+        if !new_any {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     out
 }
 
 #[cfg(not(windows))]
 fn resume_unix(target: &FreezeTarget) -> bool {
-    let pids = tree_pids(&target.roots);
+    // 与 freeze 对称：先组 SIGCONT 原子恢复主群，再补树内跨组子孙
+    // （SIGCONT 幂等，对运行中进程无害；重扫树也能覆盖冻结期间新增成员）。
     let mut any = false;
-    for &pid in &pids {
-        any |= unix_impl::resume_pid(pid);
-    }
     if let Some(pgid) = target.pgid {
         any |= unix_impl::resume_group(pgid);
+    }
+    for &pid in &tree_pids(&target.roots) {
+        any |= unix_impl::resume_pid(pid);
     }
     any
 }

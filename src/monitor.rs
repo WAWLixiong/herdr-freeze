@@ -51,7 +51,11 @@ pub struct Monitor {
     /// pane_id -> 上次 revision（便宜初筛，省 process-info spawn）
     last_rev: HashMap<String, u64>,
     cooldown: HashMap<String, Instant>,
-    last_md_refresh: Instant,
+    /// 上次元数据续期时刻。None = 尚未续期过（首 tick 即续期）。不能用
+    /// `Instant::now() - METADATA_REFRESH` 表达「启动后尽快续期」——开机不满
+    /// METADATA_REFRESH 时 Instant 减 Duration 下溢 panic（hook 拉起即死，
+    /// stderr 被 herdr 吞掉，无任何痕迹）。
+    last_md_refresh: Option<Instant>,
     focus_rx: mpsc::Receiver<FocusEvent>,
 }
 
@@ -63,7 +67,7 @@ impl Monitor {
             last_active: HashMap::new(),
             last_rev: HashMap::new(),
             cooldown: HashMap::new(),
-            last_md_refresh: Instant::now() - METADATA_REFRESH, // 启动后尽快续期一次
+            last_md_refresh: None, // 首 tick 即续期（见字段注释）
             focus_rx,
         }
     }
@@ -179,8 +183,11 @@ impl Monitor {
 
         let workspaces = api::workspace_list()?;
 
-        // 3) 元数据续期（配置 token ttl=24h，每小时续一次）
-        if self.last_md_refresh.elapsed() >= METADATA_REFRESH {
+        // 3) 元数据续期（配置 token ttl=24h，每小时续一次；首 tick 即续期）
+        if self
+            .last_md_refresh
+            .map_or(true, |t| t.elapsed() >= METADATA_REFRESH)
+        {
             for ws in &workspaces {
                 let tokens = &ws.tokens;
                 if tokens.contains_key("freeze_enabled") || tokens.contains_key("freeze_idle_secs")
@@ -206,7 +213,7 @@ impl Monitor {
                     );
                 }
             }
-            self.last_md_refresh = Instant::now();
+            self.last_md_refresh = Some(Instant::now());
         }
 
         for ws in &workspaces {
@@ -335,6 +342,22 @@ impl Monitor {
                     );
                     self.last_cpu.insert(p.pane_id.clone(), (cur, now));
                     self.last_active.insert(p.pane_id.clone(), now);
+                    continue;
+                }
+                // agent pane 首次观察到即为 idle/done：建 idle 基线（对齐
+                // work-assistant「会话创建即初始化时间戳」语义）。否则 last_cpu
+                // 永远为空，下方 cpu_idle_since 每轮 unwrap_or(now) 恒为 0，
+                // 从 monitor 启动起就 idle 的 agent pane（如重启 herdr 后恢复的
+                // opencode pane）永远 skip(idle) 不冻结。曾 working 过的 pane
+                // 在 working tick 已写入基线，不进此分支，行为不变。
+                if is_agent && prev.is_none() {
+                    self.last_cpu.insert(p.pane_id.clone(), (cur, now));
+                    self.last_active.entry(p.pane_id.clone()).or_insert(now);
+                    freeze_dbg!(
+                        "pane={} agent={} 首次观察，建 idle 基线",
+                        p.pane_id,
+                        agent_status.unwrap_or("")
+                    );
                     continue;
                 }
                 // CPU 不变 → 检查空闲时长 + 聚焦 grace
