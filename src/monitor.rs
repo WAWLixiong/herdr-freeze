@@ -469,6 +469,15 @@ impl Monitor {
             pgid: info.foreground_process_group_id,
         };
         let suspended = freezer::freeze(&target);
+        // 空 → 平台不支持或全部句柄打开失败，没真正冻住进程：不贴标、不持久化，
+        // 否则会给一个仍在跑的 pane 贴 ❄ 并留下无法恢复的 frozen 记录。
+        if suspended.is_empty() {
+            freeze_log!(
+                "freeze_pane {}: freeze 无产出（平台不支持或全部失败），跳过贴标/持久化",
+                p.pane_id
+            );
+            return;
+        }
         // 剥掉 label 开头所有前导 ❄（及夹的空格）得到纯净 label，再加单层 ❄。
         // herdr pane rename 会 trim 末尾空格，"❄ " 被存成 "❄"（无空格），下次
         // starts_with("❄ ") 失败 → 叠加成 "❄ ❄"。剥前导 ❄ 后再加既防叠加，

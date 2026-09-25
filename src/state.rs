@@ -81,6 +81,8 @@ fn freeze_now_path() -> PathBuf {
 }
 
 /// 追加一条「立即冻结当前 tab」信号（手动 freeze-now 动作）。
+/// 仅 Windows：非 Windows freeze-now 直接拒绝，不会 push。
+#[cfg(windows)]
 pub fn push_freeze_now_request(tab_id: &str) {
     let path = freeze_now_path();
     let mut list: Vec<String> = match std::fs::read_to_string(&path) {

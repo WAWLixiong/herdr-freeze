@@ -22,26 +22,41 @@ pub struct FreezeTarget {
 }
 
 /// 挂起目标。成功返回真正被打开并尝试挂起的 pid 列表（仅供日志）。
+/// 非 Windows：冻结不可用（herdr 拥有 PTY，外部 SIGSTOP 会被 shell job control
+/// 抢终端、SIGCONT 无法恢复；Mach task_suspend 受 SIP 卡死），no-op 返回空。
+/// 调用方据空返回跳过贴标/持久化。
 pub fn freeze(target: &FreezeTarget) -> Vec<u32> {
+    #[cfg(not(windows))]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            crate::freeze_log!(
+                "freeze: 非 Windows 平台不支持冻结（herdr PTY/job-control 限制，详见 README「限制」），no-op。"
+            );
+        }
+        let _ = target;
+        Vec::new()
+    }
     #[cfg(windows)]
     {
         freeze_tree_windows(&target.roots)
     }
-    #[cfg(not(windows))]
-    {
-        freeze_unix(target)
-    }
 }
 
 /// 恢复目标（幂等：对未挂起进程 resume 也无害）。
+/// 非 Windows：与 freeze 对称 no-op。macOS 实际不冻结，frozen.json 不会有新
+/// 条目；对升级前残留的旧 broken-freeze 条目也不再 SIGCONT（SIGCONT 本就恢复
+/// 不了被 shell 抢终端的进程，需用户在 shell 内 fg）。
 pub fn resume(target: &FreezeTarget) -> bool {
+    #[cfg(not(windows))]
+    {
+        let _ = target;
+        false
+    }
     #[cfg(windows)]
     {
         resume_tree_windows(&target.roots)
-    }
-    #[cfg(not(windows))]
-    {
-        resume_unix(target)
     }
 }
 

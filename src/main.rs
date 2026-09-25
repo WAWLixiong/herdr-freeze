@@ -559,14 +559,25 @@ fn thaw_cmd(args: &[String]) -> i32 {
 
 /// 立即冻结当前 tab（信号：由监控守护进程下一轮处理，需监控在跑）。
 fn freeze_now_cmd(args: &[String]) -> i32 {
-    let tab_id = match resolve_tab_id(args) {
-        Ok(t) => t,
-        Err(code) => return code,
-    };
-    state::push_freeze_now_request(&tab_id);
-    println!(
-        "[herdr-freeze] 已发送 freeze-now 信号 tab={}（监控下一轮处理）",
-        tab_id
-    );
-    0
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        eprintln!(
+            "[herdr-freeze] freeze-now: 本平台不支持冻结（herdr PTY/job-control 限制，详见 README「限制」）。"
+        );
+        1
+    }
+    #[cfg(windows)]
+    {
+        let tab_id = match resolve_tab_id(args) {
+            Ok(t) => t,
+            Err(code) => return code,
+        };
+        state::push_freeze_now_request(&tab_id);
+        println!(
+            "[herdr-freeze] 已发送 freeze-now 信号 tab={}（监控下一轮处理）",
+            tab_id
+        );
+        0
+    }
 }
